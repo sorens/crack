@@ -1,0 +1,400 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+require 'optparse'
+require 'progressbar'
+
+#########################################################################
+#
+# a brute force archive cracking script. uses 'unar' to test the 
+# password, captures results to a separate file. I used crunch 
+# (http://sourceforge.net/projects/crunch-wordlist/) to generate the word 
+# lists files. One word per line, multiple files allowed
+# 
+# The more specific you are with creating your word list files, the faster
+# the process. This script will only manage about 70 checks per second when 
+# used on my MacPro with 8 cores. If your machine has less, your 
+# results will likely be slower. I did not use jruby, which I am told has 
+# faster threading but I doubt the result would be significantly faster 
+# since all the work is done in a fork anyway.
+# 
+# A 2,481 word list check against a file using 8 threads resulted 68 
+# checks per second and a time of
+#
+# real	0m36.785s
+# user	1m2.841s
+# sys	1m12.041s
+
+#########################################################################
+
+# it's not ideal to try to show problems or successes in the terminal
+# but we want to capture them in case we need to refine the script
+# or use the results to open the file we're trying to crack. To that
+# end, we'll use a success and failure file to capture the appropriate
+# output. We'll append these to the file we're trying to crack.
+
+SUCCESS_OUTPUT							= "check.txt"
+FAILURE_OUTPUT							= "problem.txt"
+
+# main
+def run!
+	begin
+		# options
+		options = {}
+		options[:now] 					= Time.now.to_i.to_s
+		options[:source_file] 			= nil
+		options[:wordlist_dir]			= nil
+		options[:wordlist]				= []
+		options[:tmp_dir]				= "/tmp/crack"
+		options[:unar]					= "unar"
+		options[:thread_limit]			= 8						# 1 per core?
+		options[:threads] 				= []
+		options[:catch_errors]			= nil
+		options[:catch_succcesses]		= nil
+		options[:verbose] 				= false
+		options[:start]					= 0
+		options[:finished]				= 0
+		options[:checks]				= 0
+		options[:total_words]			= 0
+		options[:max_threads]			= 0
+		options[:semaphore_check]		= Mutex.new
+		options[:semaphore_bad] 		= Mutex.new
+		options[:semaphore_progress]	= Mutex.new
+		options[:semaphore_options]		= Mutex.new
+		options[:cancelled]				= false
+		options[:progress]				= nil
+		options[:title_width]			= 30
+
+		opts_parser = OptionParser.new do |opts|
+			opts.banner = "usage: crack FILE"
+
+			opts.on( "-d", "--dir [DIR]", "word list directory" ) do |dir|
+				options[:wordlist_dir] = dir
+			end
+
+			opts.on( "-w", "--wordlist [WORDLIST]", "word list file" ) do |wordlist|
+				options[:wordlist] << wordlist
+			end
+
+			opts.on( "-v", "--verbose", "display verbose output" ) do
+				options[:verbose] = true
+			end
+
+			opts.on( "-h", "--help", "help" ) do
+				puts opts_parser
+				exit
+			end
+		end
+
+		opts_parser.parse!
+		options[:source_file] = ARGV[0] unless ARGV[0].nil?
+
+		if options[:source_file].nil?
+			puts " ==> please specify a file" if options[:verbose]
+			puts opts_parser
+			exit 1
+		end
+
+		unless File.exist?(options[:source_file])
+			puts " ==> file '#{options[:source_file]}' does not exist" if options[:verbose]
+			puts opts_parser
+			exit 1
+		end
+
+		if options[:wordlist].empty?
+			if options[:wordlist_dir].nil?
+				puts " ==> please specify a word list or a directory (-w word list file or -d word list directory)" if options[:verbose]
+				puts opts_parser
+				exit 1
+			end
+
+			directory = File.join( options[:wordlist_dir], "**/*.*" )
+			options[:wordlist] = Dir.glob(directory)
+		end
+
+		if options[:wordlist].empty?
+			puts " ==> please specify a word list or a directory (-w word list file or -d word list directory)" if options[:verbose]
+			puts opts_parser
+			exit 1
+		end
+
+		# is unar installed?
+		begin
+			unless (`#{options[:unar]} -h` =~ /unar v.*/)
+				puts opts_parser
+				puts " ==> '#{options[:unar]}' required, please install"
+				exit 1
+			end
+		rescue
+			puts opts_parser
+			puts " ==> '#{options[:unar]}' required, please install"
+			exit 1
+		end
+
+		unless defined?( ProgressBar )
+			puts " ==> please install ProgressBar or use verbose (-v)"
+			puts opts_parser
+			exit 1
+		end
+
+		# setup success and failure output files
+		parent_directory = File.dirname(options[:source_file])
+		filename = File.basename(options[:source_file])
+		options[:catch_succcesses] = File.join( parent_directory, "#{options[:now]}-#{filename}-#{SUCCESS_OUTPUT}" )
+		options[:catch_errors] = File.join( parent_directory, "#{options[:now]}-#{filename}-#{FAILURE_OUTPUT}" )
+
+		# thread config
+		Thread.abort_on_exception = true
+		
+		# how many checks are we going to do?
+		wordfile_count = options[:wordlist].count
+		ProgressBar.title_width = options[:title_width]
+		bar = ProgressBar.new( " loading dictionaries (#{wordfile_count})", wordfile_count)
+		options[:wordlist].each do |file|
+			if File.exists?( file )
+				# count the lines in each wordlist, the total will be how
+				# many checks we'll make
+				options[:total_words] = options[:total_words] + `cat '#{file}' |sed '/^\s*$/d' | wc -l`.to_i
+				bar.warning
+				bar.inc
+			end
+		end
+		bar.finish
+
+		# show how many words we're going to try
+		puts " total words (#{options[:total_words]})"
+
+		# setup the progress bar for our checking
+		options[:progress] = ProgressBar.new( " (#{options[:total_words]}) checking words", options[:total_words] ) unless options[:verbose]
+		options[:progress].error unless options[:verbose] or options[:progress].nil?
+		options[:start] = Time.now.to_i
+		options[:wordlist].each do |file|
+			unless options[:cancelled]
+				if File.exists?( file )
+					# process each file of the word list
+					process_wordlist_file_memory(options,file)
+				end
+			end
+		end
+	rescue Exception => e
+		if e.is_a? Interrupt
+			options[:semaphore_options].synchronize { options[:cancelled] = true }
+			# kill off any remaining threads
+			kill_threads(options)
+			# interrupted by the user
+			options[:semaphore_progress].synchronize do
+				options[:progress].halt unless options[:progress].nil?
+			end
+			output_progressbar( options, " ==> cancelled by user") if options[:verbose]
+
+		elsif e.is_a? SystemExit
+			output_progressbar( options, " ==> system exit") if options[:verbose]
+		else
+			puts "#{e.message}\r\n"
+			puts e.backtrace
+		end
+	ensure
+		# wait to make sure our threads have finished
+		while !check_threads(options)
+			sleep(0.001)
+		end
+		# kill off any remaining threads
+		kill_threads(options)
+
+		options[:semaphore_progress].synchronize { options[:progress].title = " finished" if defined?( ProgressBar ) and options[:progress] and ! options[:verbose] }
+
+		options[:semaphore_options].synchronize { options[:finished] = Time.now.to_i } if options[:finished] == 0 and options[:start] > 0
+		# finish the progress bar
+		options[:semaphore_progress].synchronize { options[:progress].finish } if defined?( ProgressBar ) and options[:progress] and ! options[:verbose] and ! options[:cancelled]
+
+		# summarize
+		if options[:checks] > 0
+			output_progressbar( options, "" )
+			output_progressbar( options, "===================== SUMMARY ===================== " )
+			output_progressbar( options, "Maximum number of threads used: 	#{humanize_number(options[:max_threads])}" )
+			output_progressbar( options, "Total Number of words: 			#{humanize_number(options[:total_words])}" )
+			output_progressbar( options, "Total Number of words checked: 		#{humanize_number(options[:checks])}" )
+			output_progressbar( options, "Total Number of seconds: 		#{humanize_number(options[:finished]-options[:start])} s" )
+			output_progressbar( options, "Total Number of checks/second: 		#{calculate_checks_per_second(options)} c/s" )
+			output_progressbar( options, "=================================================== " )
+		end
+		options[:semaphore_options].synchronize { options[:progress] = nil }
+	end
+	exit
+end
+
+# if ProgressBar is available, use it to help output
+# some string messages
+def output_progressbar(options, string)
+	if defined?( ProgressBar ) and options[:progress] and ! options[:verbose]
+		options[:semaphore_progress].synchronize { options[:progress].send(:output, "#{string}#{options[:progress].send(:eol)}" ) }
+	else
+		puts string
+	end
+end
+
+# helper method to humanize numbers to make them easy read
+def humanize_number(number)
+	number.to_s.reverse.gsub(/...(?=.)/,'\&,').reverse
+end
+
+# calculate how many checks we did per second
+def calculate_checks_per_second(options)
+	result = 0
+	total_seconds = options[:finished] - options[:start]
+	total_seconds = 1 if 0 == total_seconds
+	result = options[:checks] / total_seconds if options[:checks] > 0
+	result
+end
+
+# decompress word list files if they are compressed
+def decompress(options,file)
+	wordlist_file = nil
+	if File.extname(file) == ".lzma"
+		`#{options[:unar]} '#{file}' -D -f -o /tmp/lzma/`
+		wordlist_file = File.join( options[:tmp_dir], File.basename( file, ".lzma" ) )
+	elsif File.extname(file) == ".bzip2"
+		write_to_screen options, " **** FIXME bzip2 unsupported **** "
+		exit
+	elsif File.extname(file) == ".txt"
+		wordlist_file = file
+	end
+	wordlist_file
+end
+
+# process the word list file into memory. each line because an
+# an array entry, one word per entry
+def process_wordlist_file_memory(options,file)
+	wordlist_file = decompress(options,file)
+	write_to_screen options, "#{wordlist_file}"
+	# read the wordlist file into memory, store as an array
+	words = File.readlines( wordlist_file )
+	# iterate over array in memory
+	words.each do |word|
+		stop = false
+		word = word.strip.chomp
+		unless word.empty?
+			options[:semaphore_options].synchronize { options[:max_threads] = options[:threads].count if options[:threads].count > options[:max_threads] }
+			while options[:threads].count >= options[:thread_limit]
+				sleep(0.001) unless check_threads(options)
+			end
+			options[:semaphore_options].synchronize do
+				options[:threads] << Thread.new do
+					stop = process_word(options,word,wordlist_file)
+				end
+			end
+		end
+		break if stop
+	end
+end
+
+# check our threads to see if all our threads are done (true) or still running (false)
+def check_threads(options)
+	return true if options[:threads].nil? or options[:threads].empty?
+	options[:threads].each do |thread|
+		if thread
+			if ! thread.alive?
+				options[:semaphore_options].synchronize do
+					Thread.kill(thread)
+					options[:threads].delete(thread)
+				end
+			end
+		end
+	end
+	false
+end
+
+# kill all our threads
+def kill_threads(options)
+	return if options[:threads].nil? or options[:threads].empty?
+	options[:threads].each do |thread|
+		options[:semaphore_options].synchronize do
+			Thread.kill(thread)
+			options[:threads].delete(thread)
+			thread = nil
+		end
+	end
+end
+
+# process the result from our forked attempt to use the word as a password
+def process_result(options,word,file,result)
+	stop = false
+	write_to_screen options, "result: #{result}", 2
+	case result
+	when /Missing or wrong password/
+		# continue
+	when /Failed!/
+		# continue
+	when /Opening file/
+		report_problem( options, result, "Opening file", file, word )
+		stop = true
+	when /Data is corrupted/
+		report_problem( options, result, "Data is corrupted", file, word )
+		stop = true
+	when /not fully supported/
+		report_problem( options, result, "not fully supported", file, word )
+		stop = true
+	when /Successfully extracted/
+		options[:semaphore_progress].synchronize { options[:progress].reset_status }  if defined?( ProgressBar ) and options[:progress] and ! options[:verbose] and ! options[:cancelled]
+		report_success( options, result, "success", file, word )
+	else
+		report_problem( options, result, "else", file, word )
+		stop = true
+	end
+	stop
+end
+
+# process each word by forking and trying it as a password to our source file
+def process_word(options, word, file)
+	stop = false
+	return false if word.nil?
+	options[:semaphore_progress].synchronize { options[:progress].title = " (#{options[:checks]}) checking '#{word}'" if defined?( ProgressBar ) and options[:progress] and ! options[:verbose] and ! options[:cancelled] }
+	result = nil
+	begin
+		command = "#{options[:unar]} -f -p '#{word}' '#{options[:source_file]}'"
+		write_to_screen options, "#{command}", 2
+		result = `#{command}`.gsub(/[\r\n]/, ',')
+		stop = process_result(options,word,file,result)
+	rescue Exception => e
+		report_problem( options, e.message, "exception", file, word )
+		write_to_screen options, " !! #{e.message} !!", 2
+		stop = true
+	ensure
+		options[:semaphore_progress].synchronize { options[:progress].inc }  if defined?( ProgressBar ) and options[:progress] and ! options[:verbose] and ! options[:cancelled]
+		options[:semaphore_options].synchronize {  options[:checks] = options[:checks] + 1 }
+	end
+	stop
+end
+
+# escape a string
+def escape_string(options,result)
+	result.dump
+end
+
+# report a possible success
+def report_success(options, result, data, word, file )
+	command = "echo '#{Time.now.to_i}: #{file},#{word},#{data},#{escape_string(options,result)}' >> #{options[:catch_succcesses]}"
+	options[:semaphore_check].synchronize { `#{command}` }
+end
+
+# report a problem
+def report_problem(options, result, data, word, file)
+	command = "echo '#{Time.now.to_i}: #{file},#{word},#{data},#{escape_string(options,result)}' >> #{options[:catch_errors]}"
+	options[:semaphore_bad].synchronize { `#{command}` }
+end
+
+# used to output debug information in verbose mode
+def write_to_screen(options, text, level=1)
+	return unless options[:verbose]
+	buffer = " #{Thread.current.to_s.gsub(/#<Thread:/,"").gsub(/>/,"")} "
+	move_cursor = level
+	while move_cursor > 0
+		buffer = buffer + "  "
+		move_cursor = move_cursor - 1
+	end
+	buffer = buffer + "==> #{text}\r\n"
+	puts buffer
+end
+
+# call our main
+run! if __FILE__ == $PROGRAM_NAME
