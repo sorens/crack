@@ -38,6 +38,15 @@ use a directory of word list files
 
 	./crack -d path/to/dir sample.zip
 
+![sample-red](https://raw.github.com/sorens/crack/master/docs/images/sample-01-red.png)
+
+The progress bar will remain red until there is a success.
+
+![sample-green](https://raw.github.com/sorens/crack/master/docs/images/sample-01-green.png)
+
+Once there is a success, the progess bar turns green. This helps alert you that there has already been a success and you may not need to keep processing.
+
+
 warranty, disclaimer, legal, etc
 ----
 
