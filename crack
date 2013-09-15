@@ -214,7 +214,7 @@ def run!
 			output_progressbar( options, "Maximum number of threads used: 	#{humanize_number(options[:max_threads])}" )
 			output_progressbar( options, "Total Number of words: 			#{humanize_number(options[:total_words])}" )
 			output_progressbar( options, "Total Number of words checked: 		#{humanize_number(options[:checks])}" )
-			output_progressbar( options, "Total Number of seconds: 		#{humanize_number(options[:finished]-options[:start])} s" )
+			output_progressbar( options, "Total Elapsed Time: 			#{humanize_time(options[:finished]-options[:start])}" )
 			output_progressbar( options, "Total Number of checks/second: 		#{calculate_checks_per_second(options)} c/s" )
 			output_progressbar( options, "=================================================== " )
 		end
@@ -233,9 +233,21 @@ def output_progressbar(options, string)
 	end
 end
 
-# helper method to humanize numbers to make them easy read
+# helper method to humanize numbers to make them easy to read
 def humanize_number(number)
 	number.to_s.reverse.gsub(/...(?=.)/,'\&,').reverse
+end
+
+# helper method to humanize the time to make it easy to read
+def humanize_time(time)
+	mm, ss = time.divmod(60)
+	hh, mm = mm.divmod(60)
+	dd, hh = hh.divmod(24)
+	days = "%d days, " % [dd] if dd > 0
+	hours = "%d hours, " % [hh] if hh > 0
+	minutes = "%d minutes, " % [mm] if mm > 0
+	seconds = "%d seconds" % [ss] 
+	"#{days}#{hours}#{minutes}#{seconds}"
 end
 
 # calculate how many checks we did per second
