@@ -27,6 +27,8 @@ help
 	    -v, --verbose                    display verbose output
 	    -h, --help                       help
 
+![help](docs/images/crack-help.png)	    
+
 examples
 ----
 
@@ -38,14 +40,18 @@ use a directory of word list files
 
 	./crack -d path/to/dir sample.zip
 
-![sample-red](https://raw.github.com/sorens/crack/master/docs/images/sample-01-red.png)
+![sample-red](docs/images/sample-01-red.png)
 
 The progress bar will remain red until there is a success.
 
-![sample-green](https://raw.github.com/sorens/crack/master/docs/images/sample-01-green.png)
+![sample-green](docs/images/sample-01-green.png)
 
 Once there is a success, the progess bar turns green. This helps alert you that there has already been a success and you may not need to keep processing.
 
+![long-green-cancelled](docs/images/crack-long-green-cancelled.png)
+![long-green](docs/images/crack-long-green.png)
+![long-red](docs/images/crack-long-red.png)
+![sample-01-green-cancelled](docs/images/sample-01-green-cancelled.png)
 
 warranty, disclaimer, legal, etc
 ----
